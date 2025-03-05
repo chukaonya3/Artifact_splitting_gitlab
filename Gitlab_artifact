@@ -1,0 +1,118 @@
+variables:
+  CHUNK_SIZE: 100M
+  MAX_CHUNKS: 50
+
+stages:
+  - prepare
+  - split
+  - upload
+  - combine
+
+prepare-large-file:
+  stage: prepare
+  script:
+    - ./generate_large_file.sh
+    - FILE_SIZE=$(du -m largefile.bin | cut -f1)
+    - echo "File size: ${FILE_SIZE}MB"
+    - |
+      CHUNK_COUNT=$(split -b $CHUNK_SIZE largefile.bin part- | wc -l)
+      if [ $CHUNK_COUNT -gt $MAX_CHUNKS ]; then
+        echo "Error: Too many chunks (${CHUNK_COUNT}). Limit is $MAX_CHUNKS"
+        exit 1
+      fi
+  artifacts:
+    paths:
+      - largefile.bin
+    expire_in: 1 hour
+  rules:
+    - changes:
+        - generate_large_file.sh
+
+split-file:
+  stage: split
+  script:
+    - mkdir -p parts
+    - split -b $CHUNK_SIZE largefile.bin parts/part-
+    - cd parts && md5sum part-* > checksums.md5
+  dependencies:
+    - prepare-large-file
+  artifacts:
+    paths:
+      - parts/
+    expire_in: 1 day
+  rules:
+    - exists:
+        - largefile.bin
+
+.upload-template: &upload-template
+  stage: upload
+  script:
+    - cd parts
+    - md5sum -c checksums.md5
+  artifacts:
+    paths:
+      - parts/${PART_NAME}
+    expire_in: 1 week
+
+generate-upload-jobs:
+  stage: upload
+  script:
+    - |
+      echo "stages: [upload]" > child-pipeline.yml
+      for part in parts/part-*; do
+        partname=$(basename $part)
+        cat >> child-pipeline.yml << EOF
+  ${partname}-upload:
+    stage: upload
+    script:
+      - cp $part $partname
+    artifacts:
+      paths:
+        - $partname
+  EOF
+      done
+  dependencies:
+    - split-file
+  artifacts:
+    paths:
+      - child-pipeline.yml
+    expire_in: 1 hour
+
+trigger-uploads:
+  stage: upload
+  trigger:
+    include:
+      - artifact: child-pipeline.yml
+        job: generate-upload-jobs
+  rules:
+    - exists:
+        - child-pipeline.yml
+
+combine-chunks:
+  stage: combine
+  script:
+    - |
+      EXPECTED_PARTS=$(ls parts/part-* | wc -l)
+      FOUND_PARTS=$(find . -name 'part-*' | wc -l)
+      if [ $EXPECTED_PARTS -ne $FOUND_PARTS ]; then
+        echo "Error: Missing file parts"
+        exit 1
+      fi
+    - cat parts/part-* > reconstructed_largefile.bin
+    - ORIGINAL_MD5=$(md5sum largefile.bin | cut -d' ' -f1)
+    - RECONSTRUCTED_MD5=$(md5sum reconstructed_largefile.bin | cut -d' ' -f1)
+    - |
+      if [ "$ORIGINAL_MD5" != "$RECONSTRUCTED_MD5" ]; then
+        echo "Error: File reconstruction failed. MD5 mismatch"
+        exit 1
+      fi
+    - ./process_large_file.sh reconstructed_largefile.bin
+  dependencies:
+    - prepare-large-file
+    - split-file
+  artifacts:
+    paths:
+      - reconstructed_largefile.bin
+    expire_in: 1 week
+  rules:
+    - when: manual
