@@ -1,0 +1,38 @@
+# Stage 1: Extract the Kaniko executor binary
+FROM gcr.io/kaniko-project/executor:v1.3.0-debug AS kaniko
+
+# Stage 2: Final Azure CLI image with Kaniko
+FROM mcr.microsoft.com/azure-cli:latest
+
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    git \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy Kaniko executor and configuration from the first stage
+COPY --from=kaniko /kaniko/executor /usr/local/bin/kaniko
+COPY --from=kaniko /kaniko/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=kaniko /kaniko/.docker /root/.docker
+
+# Make sure the binary is executable
+RUN chmod +x /usr/local/bin/kaniko
+
+# Set required environment variables for Kaniko
+ENV HOME=/root
+ENV USER=root
+ENV SSL_CERT_DIR=/etc/ssl/certs
+ENV PATH=$PATH:/usr/local/bin
+
+# Create a workspace directory
+WORKDIR /workspace
+
+# Create a simple script to use Kaniko with appropriate defaults
+RUN echo '#!/bin/sh\n\
+exec /usr/local/bin/kaniko "$@"\n\
+' > /usr/local/bin/build-image && \
+chmod +x /usr/local/bin/build-image
+
+# Keep the container running
+ENTRYPOINT ["/bin/bash"]
